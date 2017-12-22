@@ -1077,7 +1077,7 @@ version_check_dnsmasq() {
     echo -e "${OVER}  ${TICK} No dnsmasq.conf found... restoring default dnsmasq.conf..."
   fi
 
-  echo -en "  ${INFO} Copying 01-pihole.conf to /etc/dnsmasq.d/01-pihole.conf..."
+  echo -en "  ${INFO} Copying 01-pihole.conf to ${ETC_PATH}/dnsmasq.d/01-pihole.conf..."
   # Copy the new Pi-hole DNS config file into the dnsmasq.d directory
   cp ${dnsmasq_pihole_01_snippet} ${dnsmasq_pihole_01_location}
   echo -e "${OVER}  ${TICK} Copying 01-pihole.conf to /etc/dnsmasq.d/01-pihole.conf"
@@ -1099,7 +1099,8 @@ version_check_dnsmasq() {
     ${SED_REPLACE} '/^server=@DNS2@/d' ${dnsmasq_pihole_01_location}
   fi
 
-  ${SED_REPLACE} "s/@ETC_PATH@/${ETC_PATH}/" ${dnsmasq_pihole_01_location}
+  # use `#` as seperator so we can replace paths easily
+  ${SED_REPLACE} "s#@ETC_PATH@#${ETC_PATH}#" ${dnsmasq_pihole_01_location}
 
   #
   set_config_file_line "/usr/local/etc/dnsmasq.conf" "conf-dir=/usr/local/etc/dnsmasq.d/,*.conf"
@@ -1383,8 +1384,6 @@ install_dependent_packages() {
       #
       return 0
   fi
-
-    echo "HI :)"
 
   # Install Fedora/CentOS packages
   for i in "${argArray1[@]}"; do
@@ -2145,7 +2144,6 @@ main() {
       # just install the Core dependencies
       DEPS=("${PIHOLE_DEPS[@]}")
     fi
-    echo "HI :))"
 
     install_dependent_packages DEPS[@]
 
