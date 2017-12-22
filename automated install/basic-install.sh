@@ -21,6 +21,12 @@
 # instead of continuing the installation with something broken
 set -e
 
+err_report() {
+    echo "Error on line $1"
+}
+
+trap 'err_report $LINENO' ERR
+
 ######## VARIABLES #########
 # For better maintainability, we store as much information that can change in variables
 # This allows us to make a change in one place that can propogate to all instances of the variable
@@ -42,8 +48,8 @@ coltable=/opt/pihole/COL_TABLE
 # We store several other folders and
 webInterfaceGitUrl="https://github.com/pi-hole/AdminLTE.git"
 webInterfaceDir="/var/www/html/admin"
-piholeGitUrl="https://github.com/pi-hole/pi-hole.git"
-PI_HOLE_LOCAL_REPO="/etc/.pihole"
+piholeGitUrl="https://github.com/leifdenby/pi-hole.git"
+PI_HOLE_LOCAL_REPO="/usr/local/etc/pihole/git-repo"
 # These are the names of piholes files, stored in an array
 PI_HOLE_FILES=(chronometer list piholeDebug piholeLogFlush setupLCD update version gravity uninstall webpage)
 # This folder is where the Pi-hole scripts will be installed
@@ -121,6 +127,39 @@ show_ascii_berry() {
                 .',,,,,,'.
                   ..'''.${COL_NC}
 "
+}
+
+# https://unix.stackexchange.com/a/6348
+find_os_info() {
+  if [ -f /etc/os-release ]; then
+      # freedesktop.org and systemd
+      . /etc/os-release
+      OS_NAME=$NAME
+      OS_VER=$VERSION_ID
+  elif type lsb_release >/dev/null 2>&1; then
+      # linuxbase.org
+      OS_NAME=$(lsb_release -si)
+      OS_VER=$(lsb_release -sr)
+  elif [ -f /etc/lsb-release ]; then
+      # For some versions of Debian/Ubuntu without lsb_release command
+      . /etc/lsb-release
+      OS_NAME=$DISTRIB_ID
+      OS_VER=$DISTRIB_RELEASE
+  elif [ -f /etc/debian_version ]; then
+      # Older Debian/Ubuntu/etc.
+      OS_NAME=Debian
+      OS_VER=$(cat /etc/debian_version)
+  elif [ -f /etc/SuSe-release ]; then
+      # Older SuSE/etc.
+      ...
+  elif [ -f /etc/redhat-release ]; then
+      # Older Red Hat, CentOS, etc.
+      ...
+  else
+      # Fall back to uname, e.g. "Linux <version>", also works for BSD, etc.
+      OS_NAME=$(uname -s)
+      OS_VER=$(uname -r)
+  fi
 }
 
 # Compatibility
@@ -217,6 +256,23 @@ elif command -v rpm &> /dev/null; then
     LIGHTTPD_GROUP="lighttpd"
     LIGHTTPD_CFG="lighttpd.conf.fedora"
     DNSMASQ_USER="nobody"
+  PKG_MANAGER_CHECK_INSTALLED="${PKG_MANAGER} -q list installed"
+
+elif command -v pkg &> /dev/null; then
+  PKG_MANAGER="pkg"
+  UPDATE_PKG_CACHE=":"
+  PKG_INSTALL=(${PKG_MANAGER} install -y)
+  PKG_COUNT="${PKG_MANAGER} info | egrep '(.i686|.x86|.noarch|.arm|.src)' | wc -l"
+  #INSTALLER_DEPS=(xdialog git iproute net-tools newt procps-ng)
+  INSTALLER_DEPS=(xdialog git newt)
+  PIHOLE_DEPS=(bind-tools curl dnsmasq findutils nmap sudo unzip wget libidn2 psmisc)
+  PIHOLE_WEB_DEPS=(lighttpd php56 php56-pdo)
+
+  LIGHTTPD_USER="www"
+  LIGHTTPD_GROUP="www"
+  LIGHTTPD_CFG="lighttpd.conf.fedora"
+  DNSMASQ_USER="nobody"
+  PKG_MANAGER_CHECK_INSTALLED="${PKG_MANAGER} list"
 
 # If neither apt-get or rmp/dnf are found
 else
@@ -361,25 +417,44 @@ resetRepo() {
 # We need to know the IPv4 information so we can effectively setup the DNS server
 # Without this information, we won't know where to Pi-hole will be found
 find_IPv4_information() {
-  # Named, local variables
-  local route
-  # Find IP used to route to outside world by checking the the route to Google's public DNS server
-  route=$(ip route get 8.8.8.8)
-  # Use awk to strip out just the interface device as it is used in future commands
-  IPv4dev=$(awk '{for (i=1; i<=NF; i++) if ($i~/dev/) print $(i+1)}' <<< "${route}")
-  # Get just the IP address
-  IPv4bare=$(awk '{print $7}' <<< "${route}")
-  # Append the CIDR notation to the IP address
-  IPV4_ADDRESS=$(ip -o -f inet addr show | grep "${IPv4bare}" |  awk '{print $4}' | awk 'END {print}')
-  # Get the default gateway (the way to reach the Internet)
-  IPv4gw=$(awk '{print $3}' <<< "${route}")
-
+  if command -v ip &> /dev/null; then
+    # Named, local variables
+    local route
+    # Find IP used to route to outside world by checking the the route to Google's public DNS server
+    route=$(ip route get 8.8.8.8)
+    # Use awk to strip out just the interface device as it is used in future commands
+    IPv4dev=$(awk '{for (i=1; i<=NF; i++) if ($i~/dev/) print $(i+1)}' <<< "${route}")
+    # Get just the IP address
+    IPv4bare=$(awk '{print $7}' <<< "${route}")
+    # Append the CIDR notation to the IP address
+    IPV4_ADDRESS=$(ip -o -f inet addr show | grep "${IPv4bare}" |  awk '{print $4}' | awk 'END {print}')
+    # Get the default gateway (the way to reach the Internet)
+    IPv4gw=$(awk '{print $3}' <<< "${route}")
+  elif command -v route &> /dev/null; then
+    # Find IP used to route to outside world by checking the the route to Google's public DNS server
+    route=$(route -v get 8.8.8.8)
+    # interface name
+    IPv4dev=$(awk 'NR==10 {print $2}' <<< ${route})
+    # Get just the IP address
+    IPv4bare=$(tail -n1 <<< "${route}" | awk '{print $5}')
+    # Append the CIDR notation to the IP address
+    # TODO work out how to look up the CIDR formatted netmask in FreeBSD
+    IPV4_ADDRESS="${IPv4bare}/20"
+    # Get the default gateway (the way to reach the Internet)
+    IPv4gw=$(tail -n1 <<< "${route}" | awk '{print $2}')
+  else
+    echo -e "  ${CROSS} couldn't look up IPv4 information"
+  fi
 }
 
 # Get available interfaces that are UP
 get_available_interfaces() {
   # There may be more than one so it's all stored in a variable
-  availableInterfaces=$(ip --oneline link show up | grep -v "lo" | awk '{print $2}' | cut -d':' -f1 | cut -d'@' -f1)
+  if [ "${OS_NAME}" == "FreeBSD" ]; then
+    availableInterfaces=$(ifconfig -l -u | tr " " "\n" | grep -v "lo")
+  else
+    availableInterfaces=$(ip --oneline link show up | grep -v "lo" | awk '{print $2}' | cut -d':' -f1 | cut -d'@' -f1)
+  fi
 }
 
 # A function for displaying the dialogs the user sees when first running the installer
@@ -523,7 +598,13 @@ testIPv6() {
 # A dialog for showing the user about IPv6 blocking
 useIPv6dialog() {
   # Determine the IPv6 address used for blocking
-  IPV6_ADDRESSES=($(ip -6 address | grep 'scope global' | awk '{print $2}'))
+  if [ "${OS_NAME}" == "FreeBSD" ]; then
+    # TODO work out how to set ip on FreeBSD
+    echo -e "  ${INFO} Warning: Setting IP address not implemented on FreeBSD"
+    IPV6_ADDRESSES=($(ifconfig | grep inet6 | awk '{print $2}'))
+  else
+    IPV6_ADDRESSES=($(ip -6 address | grep 'scope global' | awk '{print $2}'))
+  fi
 
   # For each address in the array above, determine the type of IPv6 address it is
   for i in "${IPV6_ADDRESSES[@]}"; do
@@ -727,8 +808,13 @@ setStaticIPv4() {
   # If all that fails,
   else
     # show an error and exit
-    echo -e "  ${INFO} Warning: Unable to locate configuration file to set static IPv4 address"
-    exit 1
+    if [ "${OS_NAME}" == "FreeBSD" ]; then
+      # TODO work out how to set ip on FreeBSD
+      echo -e "  ${INFO} Warning: Setting IP address not implemented on FreeBSD"
+    else
+      echo -e "  ${INFO} Warning: Unable to locate configuration file to set static IPv4 address"
+      exit 1
+    fi
   fi
 }
 
@@ -948,12 +1034,21 @@ setAdminFlag() {
 # Check if /etc/dnsmasq.conf is from pihole.  If so replace with an original and install new in .d directory
 version_check_dnsmasq() {
   # Local, named variables
-  local dnsmasq_conf="/etc/dnsmasq.conf"
-  local dnsmasq_conf_orig="/etc/dnsmasq.conf.orig"
+  if [ "${OS_NAME}" == "FreeBSD" ]; then
+    ETC_PATH="/usr/local/etc"
+    mkdir -p /usr/local/etc/dnsmasq.d/
+    SED_REPLACE="sed -i ''"  # FreeBSD requires explicit extension https://myshittycode.com/2014/07/24/os-x-sed-extra-characters-at-the-end-of-l-command-error/
+  else
+    ETC_PATH="/etc"
+    SED_REPLACE="sed -i"
+  fi
+  local dnsmasq_conf="${ETC_PATH}/dnsmasq.conf"
+  local dnsmasq_conf_orig="${ETC_PATH}/dnsmasq.conf.orig"
+  local dnsmasq_pihole_01_location="${ETC_PATH}/dnsmasq.d/01-pihole.conf"
+
   local dnsmasq_pihole_id_string="addn-hosts=/etc/pihole/gravity.list"
   local dnsmasq_original_config="${PI_HOLE_LOCAL_REPO}/advanced/dnsmasq.conf.original"
   local dnsmasq_pihole_01_snippet="${PI_HOLE_LOCAL_REPO}/advanced/01-pihole.conf"
-  local dnsmasq_pihole_01_location="/etc/dnsmasq.d/01-pihole.conf"
 
   # If the dnsmasq config file exists
   if [[ -f "${dnsmasq_conf}" ]]; then
@@ -988,33 +1083,35 @@ version_check_dnsmasq() {
   echo -e "${OVER}  ${TICK} Copying 01-pihole.conf to /etc/dnsmasq.d/01-pihole.conf"
   # Replace our placeholder values with the GLOBAL DNS variables that we populated earlier
   # First, swap in the interface to listen on
-  sed -i "s/@INT@/$PIHOLE_INTERFACE/" ${dnsmasq_pihole_01_location}
+  ${SED_REPLACE} "s/@INT@/$PIHOLE_INTERFACE/" ${dnsmasq_pihole_01_location}
   if [[ "${PIHOLE_DNS_1}" != "" ]]; then
     # Then swap in the primary DNS server
-    sed -i "s/@DNS1@/$PIHOLE_DNS_1/" ${dnsmasq_pihole_01_location}
+    ${SED_REPLACE} "s/@DNS1@/$PIHOLE_DNS_1/" ${dnsmasq_pihole_01_location}
   else
     #
-    sed -i '/^server=@DNS1@/d' ${dnsmasq_pihole_01_location}
+    ${SED_REPLACE} '/^server=@DNS1@/d' ${dnsmasq_pihole_01_location}
   fi
   if [[ "${PIHOLE_DNS_2}" != "" ]]; then
     # Then swap in the primary DNS server
-    sed -i "s/@DNS2@/$PIHOLE_DNS_2/" ${dnsmasq_pihole_01_location}
+    ${SED_REPLACE} "s/@DNS2@/$PIHOLE_DNS_2/" ${dnsmasq_pihole_01_location}
   else
     #
-    sed -i '/^server=@DNS2@/d' ${dnsmasq_pihole_01_location}
+    ${SED_REPLACE} '/^server=@DNS2@/d' ${dnsmasq_pihole_01_location}
   fi
 
+  ${SED_REPLACE} "s/@ETC_PATH@/${ETC_PATH}/" ${dnsmasq_pihole_01_location}
+
   #
-  sed -i 's/^#conf-dir=\/etc\/dnsmasq.d$/conf-dir=\/etc\/dnsmasq.d/' ${dnsmasq_conf}
+  set_config_file_line "/usr/local/etc/dnsmasq.conf" "conf-dir=/usr/local/etc/dnsmasq.d/,*.conf"
 
   # If the user does not want to enable logging,
   if [[ "${QUERY_LOGGING}" == false ]] ; then
         # Disable it by commenting out the directive in the DNS config file
-        sed -i 's/^log-queries/#log-queries/' ${dnsmasq_pihole_01_location}
+        ${SED_REPLACE} 's/^log-queries/#log-queries/' ${dnsmasq_pihole_01_location}
     # Otherwise,
     else
         # enable it by uncommenting the directive in the DNS config file
-        sed -i 's/^#log-queries/log-queries/' ${dnsmasq_pihole_01_location}
+        ${SED_REPLACE} 's/^#log-queries/log-queries/' ${dnsmasq_pihole_01_location}
     fi
 }
 
@@ -1048,19 +1145,35 @@ installScripts() {
   if is_repo "${PI_HOLE_LOCAL_REPO}"; then
     # move into the directory
     cd "${PI_HOLE_LOCAL_REPO}"
-    # Install the scripts by:
-    #  -o setting the owner to the user
-    #  -Dm755 create all leading components of destiantion except the last, then copy the source to the destiantion and setting the permissions to 755
-    #
-    # This first one is the directory
-    install -o "${USER}" -Dm755 -d "${PI_HOLE_INSTALL_DIR}"
-    # The rest are the scripts Pi-hole needs
-    install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" gravity.sh
-    install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/*.sh
-    install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./automated\ install/uninstall.sh
-    install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/COL_TABLE
-    install -o "${USER}" -Dm755 -t /usr/local/bin/ pihole
-    install -Dm644 ./advanced/bash-completion/pihole /etc/bash_completion.d/pihole
+    if [ "${OS_NAME}" == "FreeBSD" ]; then
+      # Install the scripts by:
+      #  -o setting the owner to the user
+      #  -m755 create all leading components of destiantion except the last, then copy the source to the destiantion and setting the permissions to 755
+      #
+      # This first one is the directory (not needed on FreeBSD)
+      # install -o "${USER}" -m755 -d "${PI_HOLE_INSTALL_DIR}"
+      # The rest are the scripts Pi-hole needs
+      install -o "${USER}" -m 0755 gravity.sh "${PI_HOLE_INSTALL_DIR}"
+      install -o "${USER}" -m 0755 ./advanced/Scripts/*.sh "${PI_HOLE_INSTALL_DIR}"
+      install -o "${USER}" -m 0755 ./automated\ install/uninstall.sh "${PI_HOLE_INSTALL_DIR}"
+      install -o "${USER}" -m 0755 ./advanced/Scripts/COL_TABLE "${PI_HOLE_INSTALL_DIR}"
+      install -o "${USER}" -m 0755 pihole /usr/local/bin/
+      install -m 0644 ./advanced/bash-completion/pihole /usr/local/etc/bash_completion.d/pihole
+    else
+      # Install the scripts by:
+      #  -o setting the owner to the user
+      #  -Dm755 create all leading components of destiantion except the last, then copy the source to the destiantion and setting the permissions to 755
+      #
+      # This first one is the directory
+      install -o "${USER}" -Dm755 -d "${PI_HOLE_INSTALL_DIR}"
+      # The rest are the scripts Pi-hole needs
+      install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" gravity.sh
+      install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/*.sh
+      install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./automated\ install/uninstall.sh
+      install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/COL_TABLE
+      install -o "${USER}" -Dm755 -t /usr/local/bin/ pihole
+      install -Dm644 ./advanced/bash-completion/pihole /etc/bash_completion.d/pihole
+    fi
     echo -e "${OVER}  ${TICK} ${str}"
  # Otherwise,
   else
@@ -1070,6 +1183,14 @@ installScripts() {
     exit 1
   fi
 }
+
+# https://stackoverflow.com/a/28021305
+set_config_file_line() {
+  local FILE=${1}
+  local LINE=${2}
+  grep -qF "$LINE" "$FILE" || echo "$LINE" >> "$FILE"
+}
+
 
 # Install the configs from PI_HOLE_LOCAL_REPO to their various locations
 installConfigs() {
@@ -1149,8 +1270,10 @@ enable_service() {
   if command -v systemctl &> /dev/null; then
     # use that to enable the service
     systemctl enable "${1}" &> /dev/null
-  # Othwerwise,
+  elif [ "${OS_NAME}" == "FreeBSD" ]; then
+    sudo sysrc -f /etc/rc.conf "${1}_enable=YES"
   else
+  # Othwerwise,
     # use update-rc.d to accomplish this
     update-rc.d "${1}" defaults &> /dev/null
   fi
@@ -1261,11 +1384,13 @@ install_dependent_packages() {
       return 0
   fi
 
+    echo "HI :)"
+
   # Install Fedora/CentOS packages
   for i in "${argArray1[@]}"; do
     echo -ne "  ${INFO} Checking for $i..."
     #
-    if ${PKG_MANAGER} -q list installed "${i}" &> /dev/null; then
+    if ${PKG_MANAGER_CHECK_INSTALLED} "${i}" &> /dev/null; then
       echo -e "${OVER}  ${TICK} Checking for $i"
     else
       echo -e "${OVER}  ${CROSS} Checking for $i (will be installed)"
@@ -1406,8 +1531,12 @@ create_pihole_user() {
     echo -ne "${OVER}  ${CROSS} ${str}"
     local str="Creating user 'pihole'"
     echo -ne "  ${INFO} ${str}..."
-    # create her with the useradd command
-    useradd -r -s /usr/sbin/nologin pihole
+    if [ "${OS_NAME}" == "FreeBSD" ]; then
+      pw adduser -n pihole -s /usr/sbin/nologin
+    else
+      # create her with the useradd command
+      useradd -r -s /usr/sbin/nologin pihole
+    fi
     echo -ne "${OVER}  ${TICK} ${str}"
   fi
 }
@@ -1532,7 +1661,11 @@ installPihole() {
     chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/www/html
     chmod 775 /var/www/html
     # Give pihole access to the Web server group
-    usermod -a -G ${LIGHTTPD_GROUP} pihole
+    if [ "${OS_NAME}" == "FreeBSD" ]; then
+      pw group mod ${LIGHTTPD_GROUP} -m pihole
+    else
+      usermod -a -G ${LIGHTTPD_GROUP} pihole
+    fi
     # If the lighttpd command is executable,
     if [[ -x "$(command -v lighty-enable-mod)" ]]; then
       # enable fastcgi and fastcgi-php
@@ -1933,6 +2066,8 @@ main() {
   # Check for supported distribution
   distro_check
 
+  find_os_info
+
   # Check arguments for the undocumented flags
   for var in "$@"; do
     case "$var" in
@@ -2010,6 +2145,7 @@ main() {
       # just install the Core dependencies
       DEPS=("${PIHOLE_DEPS[@]}")
     fi
+    echo "HI :))"
 
     install_dependent_packages DEPS[@]
 
